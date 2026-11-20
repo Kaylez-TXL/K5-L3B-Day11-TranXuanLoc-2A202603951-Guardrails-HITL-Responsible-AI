@@ -9,6 +9,7 @@ Gemini Red Team dùng Google ADK trong agents/*.py — không đi qua file này.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from inspect import isawaitable
 from typing import Any, Callable
 
 from core.config import (
@@ -33,6 +34,13 @@ class _MockInvocationContext:
     user_id: str = "student"
 
 
+@dataclass(frozen=True)
+class ChatResult:
+    response: str
+    blocked: bool = False
+    layer: str | None = None
+
+
 @dataclass
 class OpenAIRunner:
     """Optional ADK-style plugins + Chat Completions."""
@@ -51,15 +59,23 @@ class OpenAIRunner:
 
         return OpenAI(**(self.client_kwargs or {}))
 
-    async def chat(self, agent: OpenAIAgent, user_message: str) -> str:
+    async def chat(
+        self, agent: OpenAIAgent, user_message: str, *, user_id: str = "student"
+    ) -> str:
+        result = await self.chat_result(agent, user_message, user_id=user_id)
+        return result.response
+
+    async def chat_result(
+        self, agent: OpenAIAgent, user_message: str, *, user_id: str = "student"
+    ) -> ChatResult:
         for hook in self.input_hooks:
             blocked = hook(user_message)
             if blocked:
-                return blocked
+                return ChatResult(blocked, blocked=True, layer="input_hook")
 
-        block_msg = await self._run_input_plugins(user_message)
-        if block_msg is not None:
-            return block_msg
+        decision = await self._run_input_plugins(user_message, user_id)
+        if decision is not None:
+            return decision
 
         client = self._client()
         completion = client.chat.completions.create(
@@ -70,15 +86,15 @@ class OpenAIRunner:
             ],
             temperature=self.temperature,
         )
-        text = (completion.choices[0].message.content or "").strip()
+        text = (completion.choices[0].message.content or "").strip() if completion.choices else ""
 
         for hook in self.output_hooks:
             text = hook(text)
 
-        text = await self._run_output_plugins(text)
-        return text
+        filtered = await self._run_output_plugins(text)
+        return ChatResult(filtered, layer="output_guardrail" if filtered != text else None)
 
-    async def _run_input_plugins(self, user_message: str) -> str | None:
+    async def _run_input_plugins(self, user_message: str, user_id: str) -> ChatResult | None:
         if not self.plugins:
             return None
         try:
@@ -90,20 +106,17 @@ class OpenAIRunner:
             role="user",
             parts=[types.Part.from_text(text=user_message)],
         )
-        ctx = _MockInvocationContext()
+        ctx = _MockInvocationContext(user_id=user_id)
         for plugin in self.plugins:
             cb = getattr(plugin, "on_user_message_callback", None)
             if cb is None:
                 continue
-            try:
-                result = await cb(
-                    invocation_context=ctx, user_message=user_content
-                )
-            except TypeError:
-                result = cb(invocation_context=ctx, user_message=user_content)
+            result = cb(invocation_context=ctx, user_message=user_content)
+            if isawaitable(result):
+                result = await result
             if result is None:
                 continue
-            return _content_to_text(result)
+            return ChatResult(_content_to_text(result), blocked=True, layer=plugin.name)
         return None
 
     async def _run_output_plugins(self, text: str) -> str:
@@ -131,13 +144,12 @@ class OpenAIRunner:
             cb = getattr(plugin, "after_model_callback", None)
             if cb is None:
                 continue
-            try:
-                out = await cb(callback_context=_Ctx(), llm_response=llm_response)
-            except TypeError:
-                out = cb(callback_context=_Ctx(), llm_response=llm_response)
+            out = cb(callback_context=_Ctx(), llm_response=llm_response)
+            if isawaitable(out):
+                out = await out
             if out is not None and getattr(out, "content", None) is not None:
                 llm_response = out
-        return _content_to_text(llm_response.content) or text
+        return _content_to_text(llm_response.content)
 
 
 def _content_to_text(content: Any) -> str:

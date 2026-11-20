@@ -58,27 +58,21 @@ async def part3_assignment_suite():
     print("=" * 60)
 
     from assignment.pipeline import (
+        BlueRequestError,
         build_production_plugins,
         build_observability,
         run_assignment_suite,
     )
 
+    plugins = build_production_plugins(use_llm_judge=False)
+    audit, monitor = build_observability()
+    pipeline = {"plugins": plugins, "audit": audit, "monitor": monitor}
     try:
-        plugins = build_production_plugins(use_llm_judge=False)
-        audit, monitor = build_observability()
-        pipeline = {"plugins": plugins, "audit": audit, "monitor": monitor}
         result = await run_assignment_suite(pipeline)
-        print("Suite finished.")
-        print("Wrote outputs under repo outputs/")
-        return result
-    except NotImplementedError as e:
-        print(
-            "Chưa xong Checkpoint 3 (src/assignment/pipeline.py). "
-            "Hoàn thành rồi chạy lại từ gốc repo:\n"
-            "  python src/main.py --part 3"
-        )
-        print(f"Detail: {e}")
-        return None
+    except BlueRequestError as error:
+        raise SystemExit(str(error)) from None
+    print("Suite finished. Wrote results.json, audit_log.json and metrics.json.")
+    return result
 
 
 async def part4_attacks():
@@ -134,10 +128,9 @@ async def part4_attacks():
 
 
 async def main(parts=None):
-    setup_api_key()
-
     if parts is None:
         parts = [2, 3, 4]  # Core: CP2 → CP3 → CP4
+    setup_api_key(require_red=4 in parts)
 
     for part in parts:
         if part == 2:
