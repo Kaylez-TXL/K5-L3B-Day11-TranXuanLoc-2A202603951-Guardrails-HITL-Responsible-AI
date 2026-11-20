@@ -5,30 +5,41 @@ Checkpoint 2 — Output Guardrails
   - LLM-as-Judge                          ← optional (không chấm)
 """
 import re
-import textwrap
 
 from google.genai import types
 from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
 
 
-# ============================================================
-# Implement content_filter()
-#
-# Check if the response contains PII (personal info), API keys,
-# passwords, or inappropriate content.
-#
-# Return a dict with:
-# - "safe": True/False
-# - "issues": list of problems found
-# - "redacted": cleaned response (PII replaced with [REDACTED])
-# ============================================================
+REDACTED = "[REDACTED]"
+SENSITIVE_PATTERNS = {
+    "password": (
+        r"\b(?:password|mật\s+khẩu)"
+        r"(?:\s*[:=]\s*|\s+is\s+(?!(?:required|optional|invalid|incorrect|expired|"
+        r"case[- ]sensitive|too|at\s+least)\b)|\s+là\s+)"
+        r'(?:"[^"\r\n]+"|\'[^\'\r\n]+\'|[^\s,;]+)'
+    ),
+    "api_key": r"\bsk-[a-z0-9_-]+",
+    "db_host": r"\b(?:[a-z0-9-]+\.)+internal(?::[0-9]+)?\b",
+    "email": r"[\w.+%-]+@(?:[\w-]+\.)+[a-z]{2,}\b",
+    "phone": (
+        r"(?<!\w)(?:0|\+84[ .-]?)[1-9](?:[0-9]{8,9}|"
+        r"[0-9][ .-][0-9]{3,4}[ .-][0-9]{4})(?!\w)"
+    ),
+    "national_id": r"\b(?:[0-9]{9}|[0-9]{12})\b",
+}
+if DEMO_SECRETS:
+    SENSITIVE_PATTERNS["protected_secret"] = "|".join(
+        re.escape(secret) for secret in sorted(DEMO_SECRETS, key=len, reverse=True)
+    )
+
 
 def content_filter(response: str) -> dict:
-    """Filter response for PII, secrets, and harmful content.
+    """Filter response for PII and secrets.
 
     Args:
         response: The LLM's response text
@@ -39,21 +50,10 @@ def content_filter(response: str) -> dict:
     issues = []
     redacted = response
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
-        if matches:
-            issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+    for name, pattern in SENSITIVE_PATTERNS.items():
+        redacted, count = re.subn(pattern, REDACTED, redacted, flags=re.IGNORECASE)
+        if count:
+            issues.append(f"{name}: {count} found")
 
     return {
         "safe": len(issues) == 0,
@@ -172,16 +172,22 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        result = content_filter(response_text)
+        safe_text = result["redacted"]
+        if not result["safe"]:
+            self.redacted_count += 1
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(safe_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                safe_text = "Response blocked: I cannot safely share that information."
+
+        if safe_text != response_text:
+            llm_response.content = llm_response.content.model_copy(
+                update={"parts": [types.Part.from_text(text=safe_text)]}
+            )
+        return llm_response
 
 
 # ============================================================
